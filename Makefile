@@ -42,13 +42,13 @@ MAKEFLAGS += -rR
 .SUFFIXES:
 
 # Derive VERSION from the latest semantic tag in the repo
+# If no tag exists (e.g., feature branch), use 9.9.999
 VERSION := $(shell \
   tag=$$(git describe --tags --abbrev=0 2>/dev/null || echo ""); \
   if echo "$$tag" | grep -Eq '^[0-9]+\.[0-9]+\.[0-9]+$$'; then \
     echo $$tag; \
   elif [ -z "$$tag" ]; then \
-    echo "Error: No version tag found. Please create one (e.g. git tag 0.1.0)" >&2; \
-    exit 1; \
+    echo "9.9.999"; \
   else \
     echo "Error: Latest tag '$$tag' is not a valid semantic version (x.y.z)" >&2; \
     exit 1; \
