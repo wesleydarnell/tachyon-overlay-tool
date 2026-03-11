@@ -191,7 +191,7 @@ ifeq ($(INSIDE_DOCKER),1)
   DOCKER_RUN :=
 else
   DOCKER_BUILD_DEPS := docker/build
-  DOCKER_RUN := docker run --rm -it --privileged -v $(PWD):/project -v $(TMP_ROOT_DIR):/tmp/work -v /dev:/dev -w /project $(IMAGE_TAG)
+  DOCKER_RUN := docker run --rm -it --privileged --network=host -v $(PWD):/project -v $(TMP_ROOT_DIR):/tmp/work -v /dev:/dev -w /project $(IMAGE_TAG)
 endif
 
 docker/build: $(DOCKER_STAMP)
