@@ -109,8 +109,10 @@ INSIDE_DOCKER := $(shell sh -c '\
 # Overlay root to give the script (container path vs host path)
 ifeq ($(INSIDE_DOCKER),1)
   OVERLAY_ROOT_FOR_SCRIPT := $(abspath $(TMP_INPUT_DIR))
+	OUTPUT_ROOT_FOR_SCRIPT := $(abspath $(TMP_OUTPUT_DIR))
 else
   OVERLAY_ROOT_FOR_SCRIPT := /tmp/work/input
+	OUTPUT_ROOT_FOR_SCRIPT := /tmp/work/output
 endif
 
 # -------------------------------------1------------------------------
@@ -375,7 +377,7 @@ apply: $(DOCKER_BUILD_DEPS)
 			echo "Copying ZIP '$(INPUT_SYSTEM_IMAGE)' → $(TMP_INPUT_DIR)"; \
 			cp "$(INPUT_SYSTEM_IMAGE)" "$(TMP_INPUT_DIR)/"; \
 			echo "Unzipping into $(SYSTEM_IMAGE_OPS_DIRECTORY) ..."; \
-			$(DOCKER_RUN) bash -lc 'set -euo pipefail; cd /tmp/work/input; fname="$(notdir $(INPUT_SYSTEM_IMAGE))"; unzip -o "$$fname" -d sys_image >/dev/null'; \
+			$(DOCKER_RUN) bash -lc 'set -euo pipefail; cd $(OVERLAY_ROOT_FOR_SCRIPT); fname="$(notdir $(INPUT_SYSTEM_IMAGE))"; unzip -o "$$fname" -d sys_image >/dev/null'; \
 		else \
 			echo "Error: INPUT_SYSTEM_IMAGE must be either a directory or a .zip file (got '\''$(INPUT_SYSTEM_IMAGE)'\'' )"; \
 			exit 1; \
@@ -421,9 +423,10 @@ apply: $(DOCKER_BUILD_DEPS)
 
 	@# === Package output (zip of $(SYSTEM_IMAGE_OPS_DIRECTORY)) =========
 	@if [ -n "$(OUTPUT_SYSTEM_IMAGE)" ]; then \
+		set -e; \
 		echo "Packaging output..."; \
 		if echo "$(OUTPUT_SYSTEM_IMAGE)" | grep -qE '\.zip$$'; then \
-			$(DOCKER_RUN) bash -lc "cd /$(SYSTEM_IMAGE_OPS_DIRECTORY)/ && zip -r -q /tmp/work/output/$(notdir $(OUTPUT_SYSTEM_IMAGE)) ."; \
+			$(DOCKER_RUN) bash -lc "set -euo pipefail; mkdir -p '$(OUTPUT_ROOT_FOR_SCRIPT)'; cd '$(SYSTEM_IMAGE_OPS_DIRECTORY)'; zip -r -q '$(OUTPUT_ROOT_FOR_SCRIPT)/$(notdir $(OUTPUT_SYSTEM_IMAGE))' ."; \
 			mv "$(TMP_OUTPUT_DIR)/$(notdir $(OUTPUT_SYSTEM_IMAGE))" "$(OUTPUT_SYSTEM_IMAGE)"; \
 			echo "Output bundle created: $(abspath $(OUTPUT_SYSTEM_IMAGE))"; \
 		else \
