@@ -103,10 +103,13 @@ echo "    VENDOR_IMG: ${VENDOR_IMG:-<none>}"
 echo "    OVERLAYS  : ${OVERLAY_ROOT}"
 
 # --- Helpers ------------------------------------------------------------------
+RESOLV_BIND_TARGET=""
+
 cleanup_mounts() {
   set +e
   sudo umount "$MOUNT_POINT/boot/efi" 2>/dev/null || true
   sudo umount "$MOUNT_POINT/vendor" 2>/dev/null || true
+  [ -n "${RESOLV_BIND_TARGET:-}" ] && { sudo umount "$RESOLV_BIND_TARGET" 2>/dev/null || true; }
   sudo umount "$MOUNT_POINT/dev/pts" 2>/dev/null || true
   sudo umount "$MOUNT_POINT/run"      2>/dev/null || true
   sudo umount "$MOUNT_POINT/sys"      2>/dev/null || true
@@ -127,6 +130,24 @@ mount_binds() {
   sudo mount --bind /sys     "$MOUNT_POINT/sys"
   sudo mount --bind /run     "$MOUNT_POINT/run"
   sudo mount --bind /dev/pts "$MOUNT_POINT/dev/pts"
+  # Propagate host DNS into chroot so apt-get can resolve package mirrors.
+  # resolve it so we bind-mount to the real file path inside the chroot.
+  local resolv="$MOUNT_POINT/etc/resolv.conf"
+  local max_depth=10
+  while [ -L "$resolv" ] && [ "$max_depth" -gt 0 ]; do
+    local link
+    link="$(readlink "$resolv")"
+    if [ "${link#/}" != "$link" ]; then
+      resolv="$MOUNT_POINT$link"
+    else
+      resolv="$(dirname "$resolv")/$link"
+    fi
+    max_depth=$((max_depth - 1))
+  done
+  sudo mkdir -p "$(dirname "$resolv")"
+  sudo touch "$resolv"
+  sudo mount --bind /etc/resolv.conf "$resolv"
+  RESOLV_BIND_TARGET="$resolv"
 }
 
 # --- Flow selector: ONLY by presence of EFI image -----------------------------
