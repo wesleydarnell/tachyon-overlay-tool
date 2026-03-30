@@ -6,7 +6,7 @@ if [ "${DEBUG:-}" = "true" ]; then
 fi
 
 usage() {
-  echo "Usage: $0 -f <filesystem> -s <stack> -r <resources> -d <debug> [-e <env_list>] [-E <efi_image>] [-O <overlay_root>]"
+  echo "Usage: $0 -f <filesystem> -s <stack> -r <resources> -d <debug> [-e <env_list>] [-E <efi_image>] [-O <overlay_root>] [-U <userdata_image>]"
   echo "  -f <filesystem>: Path to the EXT4 system/root filesystem image to modify (raw EXT4 or Android sparse)."
   echo "  -r <resources> : Path to extra resources directory."
   echo "  -s <stack>     : Stack name of the overlay stack to apply."
@@ -15,6 +15,8 @@ usage() {
   echo "  -E <efi_image> : OPTIONAL path to a FAT EFI image to mount at /boot/efi (24.04 flow)."
   echo "  -O <overlay_root>: OPTIONAL path to overlay root (parent dir of 'overlays/' and 'stacks/')."
   echo "                     Defaults to /tmp/work/input."
+  echo "  -U <userdata_image>: OPTIONAL path to the raw ext4 userdata image file."
+  echo "                       Mounted at /mnt/userdata inside the chroot so overlays can modify it."
   exit 1
 }
 
@@ -26,9 +28,10 @@ STACK=""
 EFI_IMG=""
 OVERLAY_ROOT="/tmp/work/input"   # NEW: default for Docker flow
 VENDOR_IMG=""
+USERDATA_IMG=""
 ENV_LIST="${ENV_LIST:-}"
 
-while getopts ":f:r:d:s:e:E:O:V:" opt; do
+while getopts ":f:r:d:s:e:E:O:V:U:" opt; do
   case $opt in
     f) FILESYSTEM="$OPTARG" ;;
     r) RESOURCES="$OPTARG" ;;
@@ -38,6 +41,7 @@ while getopts ":f:r:d:s:e:E:O:V:" opt; do
     E) EFI_IMG="$OPTARG" ;;
     O) OVERLAY_ROOT="$OPTARG" ;;  # NEW
     V) VENDOR_IMG="$OPTARG" ;;
+    U) USERDATA_IMG="$OPTARG" ;;
     *) usage ;;
   esac
 done
@@ -66,6 +70,11 @@ if [ -n "$VENDOR_IMG" ] && [ ! -f "$VENDOR_IMG" ]; then
   exit 1
 fi
 
+if [ -n "$USERDATA_IMG" ] && [ ! -f "$USERDATA_IMG" ]; then
+  echo "Error: userdata image '$USERDATA_IMG' does not exist." >&2
+  exit 1
+fi
+
 # resolve overlay.py relative to this script (works in/out of Docker)
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 OVERLAY_CLI="${OVERLAY_CLI:-$SCRIPT_DIR/overlay.py}"
@@ -91,6 +100,10 @@ MOUNT_POINT="/mnt/tachyon"
 PATH="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:$PATH"
 mkdir -p "$TMP_DIR"
 
+# Locate sparse-image tools (android-sdk-libsparse-utils)
+SIMG2IMG="$(command -v simg2img 2>/dev/null || true)"
+IMG2SIMG="$(command -v img2simg 2>/dev/null || true)"
+
 # --- Print args ---------------------------------------------------------------
 echo "==> process-release"
 echo "    FILESYSTEM: $FILESYSTEM"
@@ -100,13 +113,102 @@ echo "    DEBUG     : ${DEBUG:-auto}"
 echo "    ENV_LIST  : ${ENV_LIST:-}"
 echo "    EFI_IMG   : ${EFI_IMG:-<none>}"
 echo "    VENDOR_IMG: ${VENDOR_IMG:-<none>}"
+echo "    USERDATA  : ${USERDATA_IMG:-<none>}"
 echo "    OVERLAYS  : ${OVERLAY_ROOT}"
 
 # --- Helpers ------------------------------------------------------------------
 RESOLV_BIND_TARGET=""
 
+USERDATA_MNT="/mnt/userdata"
+USERDATA_RAW=""
+
+prepare_userdata() {
+  # Copy userdata image for modification via debugfs (no mount needed).
+  [ -z "$USERDATA_IMG" ] && return 0
+
+  USERDATA_RAW="${TMP_DIR}/userdata.raw"
+  echo "==> Copying userdata image for modification ..."
+  echo "    Source: $USERDATA_IMG"
+  cp "$USERDATA_IMG" "$USERDATA_RAW"
+  echo "==> Userdata ready ($(stat -c%s "$USERDATA_RAW") bytes)."
+}
+
+mount_userdata() {
+  # Userdata is NOT mounted. Chroot scripts stage files to /tmp/userdata_stage/
+  # and persist_userdata injects them via debugfs after overlays complete.
+  return 0
+}
+
+persist_userdata() {
+  [ -z "$USERDATA_IMG" ] && return 0
+  [ -z "$USERDATA_RAW" ] && return 0
+
+  # Chroot scripts stage files under /tmp/userdata_stage/ (inside chroot = $MOUNT_POINT/tmp/)
+  local stage_dir="$MOUNT_POINT/tmp/userdata_stage"
+  if [ ! -d "$stage_dir" ]; then
+    echo "==> No userdata staging directory found, skipping userdata injection."
+    rm -f "$USERDATA_RAW"
+    return 0
+  fi
+
+  echo "==> Injecting staged files into userdata image via debugfs ..."
+
+  # Build debugfs command script
+  local cmds_file="${TMP_DIR}/debugfs_cmds.txt"
+  : > "$cmds_file"
+
+  # Create directories first (sorted so parents come before children)
+  (cd "$stage_dir" && find . -mindepth 1 -type d | sort) | while IFS= read -r d; do
+    d="${d#.}"
+    echo "mkdir $d" >> "$cmds_file"
+  done
+
+  # Then write files
+  (cd "$stage_dir" && find . -type f | sort) | while IFS= read -r f; do
+    f="${f#.}"
+    echo "write ${stage_dir}${f} ${f}" >> "$cmds_file"
+  done
+
+  echo "    debugfs commands:"
+  sed 's/^/      /' "$cmds_file"
+
+  debugfs -w -f "$cmds_file" "$USERDATA_RAW" 2>&1 | grep -v '^debugfs:' || true
+
+  # Copy modified image back over _1.ext4
+  echo "==> Persisting userdata back to $USERDATA_IMG ..."
+  cp "$USERDATA_RAW" "$USERDATA_IMG"
+  rm -f "$USERDATA_RAW" "$cmds_file"
+
+  # The EDL flasher writes _2.ext4 through _N.ext4 at scattered partition offsets
+  # (superblock/block-group-descriptor backups). After our modification, those stale
+  # chunks could overwrite our new data. Remove them and update the XML.
+  local ud_dir
+  ud_dir="$(dirname "$USERDATA_IMG")"
+  local prefix="qti-ubuntu-robotics-image-qcs6490-odk-userdata"
+
+  echo "==> Removing stale userdata chunk files ..."
+  local i
+  for i in "$ud_dir"/${prefix}_*.ext4; do
+    [ -f "$i" ] || continue
+    case "$(basename "$i")" in
+      "${prefix}_1.ext4") continue ;;
+      *) rm -f "$i"; echo "    Removed $(basename "$i")" ;;
+    esac
+  done
+
+  # Update rawprogram_unsparse0.xml: fix _1 sector count, remove _2+ entries
+  local xml="$ud_dir/rawprogram_unsparse0.xml"
+  if [ -f "$xml" ]; then
+    local new_sectors=$(( $(stat -c%s "$USERDATA_IMG") / 4096 ))
+    echo "==> Updating $xml: _1.ext4 num_partition_sectors=$new_sectors, removing stale chunks ..."
+    sed -i "s/filename=\"${prefix}_1\.ext4\" label=\"userdata\" num_partition_sectors=\"[0-9]*\"/filename=\"${prefix}_1.ext4\" label=\"userdata\" num_partition_sectors=\"${new_sectors}\"/" "$xml"
+    sed -i -E "/${prefix}_(([2-9]|[1-9][0-9])\.ext4)/d" "$xml"
+  fi
+}
+
 cleanup_mounts() {
   set +e
+  sudo umount "${MOUNT_POINT}${USERDATA_MNT}" 2>/dev/null || true
   sudo umount "$MOUNT_POINT/boot/efi" 2>/dev/null || true
   sudo umount "$MOUNT_POINT/vendor" 2>/dev/null || true
   [ -n "${RESOLV_BIND_TARGET:-}" ] && { sudo umount "$RESOLV_BIND_TARGET" 2>/dev/null || true; }
@@ -215,6 +317,9 @@ if [ -n "$EFI_IMG" ]; then
     sudo mount -o loop "$VENDOR_IMG" "$MOUNT_POINT/vendor"
   fi
 
+  prepare_userdata
+  mount_userdata
+
   # GRUB device.map
   if [ -d "$MOUNT_POINT/boot/grub" ]; then
     printf "(hd0) %s\n(hd1) %sp1\n" "$LOOPDEV" "$LOOPDEV" | sudo tee "$MOUNT_POINT/boot/grub/device.map" >/dev/null || true
@@ -239,6 +344,7 @@ if [ -n "$EFI_IMG" ]; then
   [ -f "$MOUNT_POINT/boot/grub/device.map" ] && sudo rm -f "$MOUNT_POINT/boot/grub/device.map"
 
   echo "==> Unmounting root & EFI ..."
+  persist_userdata
   sudo umount "$MOUNT_POINT/vendor" 2>/dev/null || true
   sudo umount "$MOUNT_POINT/boot/efi" 2>/dev/null || true
   sudo umount "$MOUNT_POINT/dev/pts" 2>/dev/null || true
@@ -287,6 +393,9 @@ if [ "$IS_SPARSE" = true ]; then
     sudo mount -o loop "$VENDOR_IMG" "$MOUNT_POINT/vendor"
   fi
 
+  prepare_userdata
+  mount_userdata
+
   # Optional, harmless for GRUB if present
   if [ -d "$MOUNT_POINT/boot/grub" ]; then
     printf "(hd0) %s\n(hd1) %s\n" "loopback" "loopback" | sudo tee "$MOUNT_POINT/boot/grub/device.map" >/dev/null || true
@@ -308,6 +417,7 @@ if [ "$IS_SPARSE" = true ]; then
 
   [ -f "$MOUNT_POINT/boot/grub/device.map" ] && sudo rm -f "$MOUNT_POINT/boot/grub/device.map"
   echo "==> Unmounting ..."
+  persist_userdata
   cleanup_mounts
 
   echo "==> Re-sparsifying back into $FILESYSTEM ..."
@@ -327,6 +437,9 @@ if [ -n "$VENDOR_IMG" ]; then
   sudo mkdir -p "$MOUNT_POINT/vendor"
   sudo mount -o loop "$VENDOR_IMG" "$MOUNT_POINT/vendor"
 fi
+
+prepare_userdata
+mount_userdata
 
 # If GRUB present, a minimal device.map can help; harmless if absent
 if [ -d "$MOUNT_POINT/boot/grub" ]; then
@@ -359,6 +472,7 @@ fi
 # Cleanup
 [ -f "$MOUNT_POINT/boot/grub/device.map" ] && sudo rm -f "$MOUNT_POINT/boot/grub/device.map"
 echo "==> Unmounting ..."
+persist_userdata
 cleanup_mounts
 
 echo "Done."

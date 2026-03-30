@@ -413,12 +413,17 @@ apply: $(DOCKER_BUILD_DEPS)
 	if [ -f "$(SYSTEM_IMAGE_OPS_DIRECTORY)/images/qcm6490/edl/NON-HLOS.bin" ]; then \
 	  VENDOR_OPT='-V $(SYSTEM_IMAGE_OPS_DIRECTORY)/images/qcm6490/edl/NON-HLOS.bin'; \
 	fi; \
+	USERDATA_OPT=""; \
+	ud_first="$(SYSTEM_IMAGE_OPS_DIRECTORY)/images/qcm6490/edl/qti-ubuntu-robotics-image-qcs6490-odk-userdata_1.ext4"; \
+	if [ -f "$$ud_first" ]; then \
+	  USERDATA_OPT="-U $$ud_first"; \
+	fi; \
 	$(DOCKER_RUN) bash ./run-overlay.sh \
 		-f "$(SYSTEM_IMAGE_OPS_DIRECTORY)/images/qcm6490/edl/qti-ubuntu-robotics-image-qcs6490-odk-sysfs_1.ext4" \
 		-r "$(SYSTEM_IMAGE_OPS_DIRECTORY)/resources" \
 		-s "$(INPUT_STACK_NAME)" \
 		-d "$(DEBUG)"$(if $(INPUT_ENV_VARS), -e "$(INPUT_ENV_VARS)",) \
-		-O "$(INPUT_OVERLAY_PATH)" $$EFI_OPT $$VENDOR_OPT
+		-O "$(INPUT_OVERLAY_PATH)" $$EFI_OPT $$VENDOR_OPT $$USERDATA_OPT
 	@echo "Overlay application completed."
 
 	@# === Package output (zip of $(SYSTEM_IMAGE_OPS_DIRECTORY)) =========
