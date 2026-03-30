@@ -123,65 +123,84 @@ USERDATA_MNT="/mnt/userdata"
 USERDATA_RAW=""
 
 prepare_userdata() {
-  # Copy userdata image for modification via debugfs (no mount needed).
+  # Prepare userdata image for mounting. If it's Android sparse, convert to raw.
   [ -z "$USERDATA_IMG" ] && return 0
 
-  USERDATA_RAW="${TMP_DIR}/userdata.raw"
-  echo "==> Copying userdata image for modification ..."
-  echo "    Source: $USERDATA_IMG"
-  cp "$USERDATA_IMG" "$USERDATA_RAW"
+  local ftype
+  ftype="$(file -b "$USERDATA_IMG" || true)"
+  echo "==> Userdata image: $USERDATA_IMG"
+  echo "    Type: $ftype"
+
+  if echo "$ftype" | grep -qi 'Android sparse image'; then
+    USERDATA_RAW="${TMP_DIR}/userdata.raw"
+    echo "==> Unsparsing userdata to $USERDATA_RAW ..."
+    if [ -n "$SIMG2IMG" ]; then
+      "$SIMG2IMG" "$USERDATA_IMG" "$USERDATA_RAW"
+    else
+      make docker-unsparse-image SYSTEM_IMAGE="$USERDATA_IMG" SYSTEM_OUTPUT="$USERDATA_RAW"
+    fi
+  elif echo "$ftype" | grep -qi 'ext4'; then
+    # Already raw ext4 — copy to avoid modifying original in-place
+    USERDATA_RAW="${TMP_DIR}/userdata.raw"
+    echo "==> Copying userdata to $USERDATA_RAW for modification ..."
+    cp "$USERDATA_IMG" "$USERDATA_RAW"
+    # The image may be a truncated sparse file (e.g. 70MB file for a 4GB filesystem).
+    # Expand it to match the filesystem's block count so mount succeeds.
+    local blk_count blk_size fs_size file_size
+    blk_count=$(tune2fs -l "$USERDATA_RAW" 2>/dev/null | awk '/^Block count:/{print $NF}')
+    blk_size=$(tune2fs -l "$USERDATA_RAW" 2>/dev/null | awk '/^Block size:/{print $NF}')
+    if [ -n "$blk_count" ] && [ -n "$blk_size" ]; then
+      fs_size=$((blk_count * blk_size))
+      file_size=$(stat -c%s "$USERDATA_RAW")
+      if [ "$file_size" -lt "$fs_size" ]; then
+        echo "==> Expanding userdata image from $file_size to $fs_size bytes (filesystem expects ${blk_count}×${blk_size}) ..."
+        truncate -s "$fs_size" "$USERDATA_RAW"
+        e2fsck -fp "$USERDATA_RAW" || true
+      fi
+    fi
+  else
+    echo "Error: unrecognized userdata format: $ftype" >&2
+    exit 1
+  fi
   echo "==> Userdata ready ($(stat -c%s "$USERDATA_RAW") bytes)."
 }
 
 mount_userdata() {
-  # Userdata is NOT mounted. Chroot scripts stage files to /tmp/userdata_stage/
-  # and persist_userdata injects them via debugfs after overlays complete.
-  return 0
+  [ -z "$USERDATA_RAW" ] && return 0
+  # Mount inside the chroot tree so chroot scripts see it at /mnt/userdata
+  local mnt="${MOUNT_POINT}${USERDATA_MNT}"
+  echo "==> Mounting userdata at $mnt (chroot: $USERDATA_MNT) ..."
+  sudo mkdir -p "$mnt"
+  sudo mount -o loop "$USERDATA_RAW" "$mnt"
 }
 
 persist_userdata() {
   [ -z "$USERDATA_IMG" ] && return 0
   [ -z "$USERDATA_RAW" ] && return 0
+  echo "==> Unmounting userdata ..."
+  sudo umount "${MOUNT_POINT}${USERDATA_MNT}" 2>/dev/null || true
+  sync
 
-  # Chroot scripts stage files under /tmp/userdata_stage/ (inside chroot = $MOUNT_POINT/tmp/)
-  local stage_dir="$MOUNT_POINT/tmp/userdata_stage"
-  if [ ! -d "$stage_dir" ]; then
-    echo "==> No userdata staging directory found, skipping userdata injection."
-    rm -f "$USERDATA_RAW"
-    return 0
+  # Shrink filesystem to pack all data at the start, then truncate file to match
+  echo "==> Shrinking userdata filesystem to minimum ..."
+  e2fsck -fp "$USERDATA_RAW" || true
+  resize2fs -M "$USERDATA_RAW" || true
+  local blk_count blk_size fs_size
+  blk_count=$(tune2fs -l "$USERDATA_RAW" 2>/dev/null | awk '/^Block count:/{print $NF}')
+  blk_size=$(tune2fs -l "$USERDATA_RAW" 2>/dev/null | awk '/^Block size:/{print $NF}')
+  if [ -n "$blk_count" ] && [ -n "$blk_size" ]; then
+    fs_size=$((blk_count * blk_size))
+    truncate -s "$fs_size" "$USERDATA_RAW"
   fi
-
-  echo "==> Injecting staged files into userdata image via debugfs ..."
-
-  # Build debugfs command script
-  local cmds_file="${TMP_DIR}/debugfs_cmds.txt"
-  : > "$cmds_file"
-
-  # Create directories first (sorted so parents come before children)
-  (cd "$stage_dir" && find . -mindepth 1 -type d | sort) | while IFS= read -r d; do
-    d="${d#.}"
-    echo "mkdir $d" >> "$cmds_file"
-  done
-
-  # Then write files
-  (cd "$stage_dir" && find . -type f | sort) | while IFS= read -r f; do
-    f="${f#.}"
-    echo "write ${stage_dir}${f} ${f}" >> "$cmds_file"
-  done
-
-  echo "    debugfs commands:"
-  sed 's/^/      /' "$cmds_file"
-
-  debugfs -w -f "$cmds_file" "$USERDATA_RAW" 2>&1 | grep -v '^debugfs:' || true
 
   # Copy modified image back over _1.ext4
   echo "==> Persisting userdata back to $USERDATA_IMG ..."
   cp "$USERDATA_RAW" "$USERDATA_IMG"
-  rm -f "$USERDATA_RAW" "$cmds_file"
+  rm -f "$USERDATA_RAW"
 
   # The EDL flasher writes _2.ext4 through _N.ext4 at scattered partition offsets
-  # (superblock/block-group-descriptor backups). After our modification, those stale
-  # chunks could overwrite our new data. Remove them and update the XML.
+  # (superblock/block-group-descriptor backups). After our modification + resize,
+  # those stale chunks would overwrite our data. Remove them and update the XML.
   local ud_dir
   ud_dir="$(dirname "$USERDATA_IMG")"
   local prefix="qti-ubuntu-robotics-image-qcs6490-odk-userdata"
